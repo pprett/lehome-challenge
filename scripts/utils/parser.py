@@ -450,7 +450,7 @@ def setup_eval_parser() -> argparse.ArgumentParser:
         default="lerobot",
         help=(
             "Type of policy to use. Available policies are registered in PolicyRegistry. "
-            "Built-in options: 'lerobot', 'custom'. "
+            "Built-in options: 'lerobot', 'custom', 'docker', 'openpi_ws'. "
             "Participants can register their own policies using @PolicyRegistry.register('my_policy')."
         ),
     )
@@ -483,6 +483,32 @@ def setup_eval_parser() -> argparse.ArgumentParser:
         type=str,
         default="http://localhost:8080",
         help="URL of the Docker policy server (used when --policy_type docker).",
+    )
+
+    # OpenPI websocket policy arguments
+    parser.add_argument(
+        "--websocket_host",
+        type=str,
+        default="localhost",
+        help="OpenPI websocket host or ws:// URI (used when --policy_type openpi_ws).",
+    )
+    parser.add_argument(
+        "--websocket_port",
+        type=int,
+        default=8000,
+        help="OpenPI websocket port (used when --policy_type openpi_ws).",
+    )
+    parser.add_argument(
+        "--websocket_api_key",
+        type=str,
+        default=None,
+        help="Optional OpenPI websocket API key (used when --policy_type openpi_ws).",
+    )
+    parser.add_argument(
+        "--websocket_n_obs_steps",
+        type=int,
+        default=None,
+        help="Override observation horizon sent to the OpenPI websocket server.",
     )
 
     return parser
