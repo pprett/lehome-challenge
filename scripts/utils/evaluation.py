@@ -5,9 +5,20 @@ import torch
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+import time
 
 from isaaclab.envs import DirectRLEnv
 from isaaclab_tasks.utils import parse_env_cfg
+
+
+from mixed_autonomy_robot import (
+    BackendHttpTransport,
+    CameraStream,
+    MediaProfile,
+    MoqMediaPublisher,
+    PythonFrameSource,
+    RobotClient,
+)
 
 from scripts.eval_policy import PolicyRegistry
 from scripts.eval_policy.base_policy import BasePolicy
@@ -42,6 +53,75 @@ def run_evaluation_loop(
     Core evaluation loop.
     Refactored to be agnostic of specific model implementations.
     """
+
+    # --- setup Robot telemetry and HIL
+
+    source = PythonFrameSource(
+        width=640,
+        height=480,
+        pixel_format="rgb8",
+        clock="wall_time",
+        max_queue_depth=2,
+    )
+    tenant_id = "dev-tenant"
+    robot_id = "isaaclab-robot-1"
+    robot = RobotClient(
+        robot_id=robot_id,
+        tenant_id=tenant_id,
+        auth_token="dev-robot-token",
+        backend=BackendHttpTransport(
+            base_url="https://wrench:8443",
+            verify_tls=False,  # FIXME this should be same arg name as media publisher
+        ),
+        media_publisher=MoqMediaPublisher(
+            relay_url="https://wrench:4443",
+            tenant_id=tenant_id,
+            robot_id=robot_id,
+            insecure=True,
+        ),
+    )
+    robot.add_camera(
+        CameraStream(
+            name="front",
+            source=source,
+            monitoring_profile=MediaProfile(
+                width=320,
+                height=240,
+                fps=5,
+                max_bitrate_kbps=1,
+            ),
+            teleop_profile=MediaProfile(
+                width=640,
+                height=480,
+                fps=30,
+                max_bitrate_kbps=1,
+            ),
+        )
+    )
+
+
+    @robot.on_command
+    def handle_command(command):
+        print(f"DEBUG MA command: {command}")
+
+    @robot.on_pause
+    def pause():
+        print("DEBUG MA pause requested")
+
+    @robot.on_reset
+    def reset(reset_pose_id):
+        print(f"DEBUG MA reset requested {reset_pose_id}")
+
+    registration = robot.connect()
+    time.sleep(1)
+
+    print("registered Mixed Autonomy robot through:")
+    print(f"  tenant_id={tenant_id}")
+    print(f"  robot_id={robot_id}")
+    print(f"  backend_session={registration.session_token}")
+    print(f"  events_ws_url={robot.backend.events_ws_url}")
+    print(f"  events_connected={robot.backend.events_connected}")
+    print(f"  last_event_error={robot.backend.last_event_error}")
 
     # --- Dataset Recording Setup (Optional) ---
     eval_dataset = None
@@ -127,6 +207,11 @@ def run_evaluation_loop(
         for st in range(args.max_steps):
             if rate_limiter:
                 rate_limiter.sleep(env)
+
+            source.push_frame(observation_dict["observation.images.top_rgb"], timestamp_ns=time.time_ns())
+
+            if st % args.step_hz == 0:
+                robot.heartbeat()
 
             # 3. Policy Inference (The core abstraction)
             # Input: Numpy Dict -> Output: Numpy Array
@@ -239,6 +324,7 @@ def run_evaluation_loop(
         )
         eval_dataset.finalize()
 
+    robot.close()
     return all_episode_metrics
 
 
