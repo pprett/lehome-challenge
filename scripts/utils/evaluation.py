@@ -11,12 +11,13 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab_tasks.utils import parse_env_cfg
 
 
-from mixed_autonomy_robot import (
+from mars import (
     BackendHttpTransport,
     CameraStream,
     MediaProfile,
     MoqMediaPublisher,
     PythonFrameSource,
+    PythonStateSource,
     RobotClient,
 )
 
@@ -56,30 +57,14 @@ def run_evaluation_loop(
 
     # --- setup Robot telemetry and HIL
 
-    source = PythonFrameSource(
+    frame_source = PythonFrameSource(
         width=640,
         height=480,
         pixel_format="rgb8",
-        clock="wall_time",
-        max_queue_depth=2,
     )
-    tenant_id = "dev-tenant"
-    robot_id = "isaaclab-robot-1"
-    robot = RobotClient(
-        robot_id=robot_id,
-        tenant_id=tenant_id,
-        auth_token="dev-robot-token",
-        backend=BackendHttpTransport(
-            base_url="https://wrench:8443",
-            verify_tls=False,  # FIXME this should be same arg name as media publisher
-        ),
-        media_publisher=MoqMediaPublisher(
-            relay_url="https://wrench:4443",
-            tenant_id=tenant_id,
-            robot_id=robot_id,
-            insecure=True,
-        ),
-    )
+    state_source = PythonStateSource("qpos")
+
+    robot = RobotClient()
     robot.add_camera(
         CameraStream(
             name="front",
@@ -208,7 +193,9 @@ def run_evaluation_loop(
             if rate_limiter:
                 rate_limiter.sleep(env)
 
-            source.push_frame(observation_dict["observation.images.top_rgb"], timestamp_ns=time.time_ns())
+            frame_source.push_frame(observation_dict["observation.images.top_rgb"], timestamp_ns=time.time_ns())
+            state_source.push_qpos(observation_dict["observation.state"], timestamp_ns=time.time_ns())
+
 
             if st % args.step_hz == 0:
                 robot.heartbeat()
