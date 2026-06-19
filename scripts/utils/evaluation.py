@@ -12,10 +12,9 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 
 from mars import (
-    BackendHttpTransport,
     CameraStream,
+    StateStream,
     MediaProfile,
-    MoqMediaPublisher,
     PythonFrameSource,
     PythonStateSource,
     RobotClient,
@@ -62,13 +61,13 @@ def run_evaluation_loop(
         height=480,
         pixel_format="rgb8",
     )
-    state_source = PythonStateSource("qpos")
+    state_source = PythonStateSource()
 
     robot = RobotClient()
     robot.add_camera(
         CameraStream(
             name="front",
-            source=source,
+            source=frame_source,
             monitoring_profile=MediaProfile(
                 width=320,
                 height=240,
@@ -83,7 +82,7 @@ def run_evaluation_loop(
             ),
         )
     )
-
+    robot.add_state(StateStream(name="qpos", source=state_source, fps=5))
 
     @robot.on_command
     def handle_command(command):
@@ -101,8 +100,8 @@ def run_evaluation_loop(
     time.sleep(1)
 
     print("registered Mixed Autonomy robot through:")
-    print(f"  tenant_id={tenant_id}")
-    print(f"  robot_id={robot_id}")
+    print(f"  tenant_id={robot.tenant_id}")
+    print(f"  robot_id={robot.robot_id}")
     print(f"  backend_session={registration.session_token}")
     print(f"  events_ws_url={robot.backend.events_ws_url}")
     print(f"  events_connected={robot.backend.events_connected}")
