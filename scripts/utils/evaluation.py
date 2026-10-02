@@ -1,5 +1,7 @@
 import os
 import argparse
+import atexit
+import subprocess
 import gymnasium as gym
 import torch
 import numpy as np
@@ -11,14 +13,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab_tasks.utils import parse_env_cfg
 
 
-from mars import (
-    CameraStream,
-    StateStream,
-    MediaProfile,
-    PythonFrameSource,
-    PythonStateSource,
-    RobotClient,
-)
+import mixed_autonomy as ma
 
 from scripts.eval_policy import PolicyRegistry
 from scripts.eval_policy.base_policy import BasePolicy
@@ -41,6 +36,17 @@ from lehome.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _terminate_sidecar(sidecar: subprocess.Popen) -> None:
+    if sidecar.poll() is not None:
+        return
+    sidecar.terminate()
+    try:
+        sidecar.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        sidecar.kill()
+        sidecar.wait(timeout=2)
+
+
 def run_evaluation_loop(
     env: DirectRLEnv,
     policy: BasePolicy,
@@ -55,57 +61,44 @@ def run_evaluation_loop(
     """
 
     # --- setup Robot telemetry and HIL
-
-    frame_source = PythonFrameSource(
-        width=640,
-        height=480,
-        pixel_format="rgb8",
-    )
-    state_source = PythonStateSource()
-
-    robot = RobotClient()
-    robot.add_camera(
-        CameraStream(
-            name="front",
-            source=frame_source,
-            monitoring_profile=MediaProfile(
-                width=320,
-                height=240,
-                fps=5,
-                max_bitrate_kbps=1,
-            ),
-            teleop_profile=MediaProfile(
-                width=640,
-                height=480,
-                fps=30,
-                max_bitrate_kbps=1,
+    # The SDK creates local shared memory first; spawn_sidecar then launches the
+    # Rust network sidecar with the matching shm path. Configure the sidecar via
+    # MA_* env vars, e.g. MA_SIDECAR_BINARY, MA_BACKEND_ADDR, MA_SERVER_NAME,
+    # MA_TENANT_ID, MA_ROBOT_ID and MA_AUTH_TOKEN_FILE.
+    sdk = ma.Client(
+        ma.ClientConfig(
+            instance_name="bimanual_so101",
+            cameras=(
+                ma.CameraConfig(
+                    name="front",
+                    width=640,
+                    height=480,
+                    pixel_format=ma.PixelFormat.RGB8,
+                    monitoring_profile=ma.MediaProfile(
+                        width=320,
+                        height=240,
+                        fps=5,
+                        jpeg_quality=60,
+                    ),
+                    teleop_profile=ma.MediaProfile(
+                        width=640,
+                        height=480,
+                        fps=30,
+                        jpeg_quality=80,
+                    ),
+                ),
             ),
         )
     )
-    robot.add_state(StateStream(name="qpos", source=state_source, fps=5))
-
-    @robot.on_command
-    def handle_command(command):
-        print(f"DEBUG MA command: {command}")
-
-    @robot.on_pause
-    def pause():
-        print("DEBUG MA pause requested")
-
-    @robot.on_reset
-    def reset(reset_pose_id):
-        print(f"DEBUG MA reset requested {reset_pose_id}")
-
-    registration = robot.connect()
-    time.sleep(1)
-
-    print("registered Mixed Autonomy robot through:")
-    print(f"  tenant_id={robot.tenant_id}")
-    print(f"  robot_id={robot.robot_id}")
-    print(f"  backend_session={registration.session_token}")
-    print(f"  events_ws_url={robot.backend.events_ws_url}")
-    print(f"  events_connected={robot.backend.events_connected}")
-    print(f"  last_event_error={robot.backend.last_event_error}")
+    sdk.start()
+    print("started Mixed Autonomy SDK shared memory:")
+    print(f"  shm_path={sdk.config.resolved_shared_memory_path}")
+    sidecar = ma.spawn_sidecar(sdk)
+    atexit.register(_terminate_sidecar, sidecar)
+    print(f"  sidecar_pid={sidecar.pid}")
+    last_ma_command_sequence: int | None = None
+    last_ma_discrete_sequence: int | None = None
+    last_ma_instruction_sequence: int | None = None
 
     # --- Dataset Recording Setup (Optional) ---
     eval_dataset = None
@@ -192,12 +185,49 @@ def run_evaluation_loop(
             if rate_limiter:
                 rate_limiter.sleep(env)
 
-            frame_source.push_frame(observation_dict["observation.images.top_rgb"], timestamp_ns=time.time_ns())
-            state_source.push_qpos(observation_dict["observation.state"], timestamp_ns=time.time_ns())
+            now_ns = time.monotonic_ns()
+            state = np.asarray(observation_dict["observation.state"], dtype=np.float64)
+            sdk.telemetry.try_publish_state(
+                timestamp_ns=now_ns,
+                qpos=state,
+                qvel=np.zeros_like(state),
+            )
+            frame_rgb = np.ascontiguousarray(
+                observation_dict["observation.images.top_rgb"], dtype=np.uint8
+            )
+            sdk.cameras["front"].try_publish(frame_rgb, timestamp_ns=now_ns)
 
+            ma_command = sdk.control.latest()
+            if (
+                ma_command is not None
+                and ma_command.meta.sequence != last_ma_command_sequence
+            ):
+                last_ma_command_sequence = ma_command.meta.sequence
+                print(f"DEBUG MA command: {ma_command}")
+                sdk.events.try_publish(
+                    ma.CommandRejected(
+                        sequence=ma_command.meta.sequence,
+                        control_epoch=ma_command.meta.control_epoch,
+                        reason=ma.RejectionReason.LOCAL_OVERRIDE,
+                        detail="simulator evaluation does not apply remote commands",
+                    )
+                )
 
-            if st % args.step_hz == 0:
-                robot.heartbeat()
+            ma_discrete = sdk.control.read_discrete()
+            if (
+                ma_discrete is not None
+                and ma_discrete.meta.sequence != last_ma_discrete_sequence
+            ):
+                last_ma_discrete_sequence = ma_discrete.meta.sequence
+                print(f"DEBUG MA discrete command: {ma_discrete}")
+
+            ma_instruction = sdk.instructions.read_if_new()
+            if (
+                ma_instruction is not None
+                and ma_instruction.sequence != last_ma_instruction_sequence
+            ):
+                last_ma_instruction_sequence = ma_instruction.sequence
+                print(f"DEBUG MA instruction: {ma_instruction.text}")
 
             # 3. Policy Inference (The core abstraction)
             # Input: Numpy Dict -> Output: Numpy Array
@@ -310,7 +340,9 @@ def run_evaluation_loop(
         )
         eval_dataset.finalize()
 
-    robot.close()
+    _terminate_sidecar(sidecar)
+    atexit.unregister(_terminate_sidecar)
+    sdk.close()
     return all_episode_metrics
 
 
