@@ -1,7 +1,6 @@
 import os
 import argparse
-import atexit
-import subprocess
+from contextlib import ExitStack
 import gymnasium as gym
 import torch
 import numpy as np
@@ -31,26 +30,17 @@ from lehome.utils.record import (
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from .common import stabilize_garment_after_reset
+from .mixed_autonomy_config import build_mixed_autonomy_evaluation_config
 from lehome.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-
-def _terminate_sidecar(sidecar: subprocess.Popen) -> None:
-    if sidecar.poll() is not None:
-        return
-    sidecar.terminate()
-    try:
-        sidecar.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        sidecar.kill()
-        sidecar.wait(timeout=2)
 
 
 def run_evaluation_loop(
     env: DirectRLEnv,
     policy: BasePolicy,
     args: argparse.Namespace,
+    sdk: ma.Client,
     ee_solver: Optional[Any] = None,
     is_bimanual: bool = False,
     garment_name: Optional[str] = None,
@@ -60,45 +50,8 @@ def run_evaluation_loop(
     Refactored to be agnostic of specific model implementations.
     """
 
-    # --- setup Robot telemetry and HIL
-    # The SDK creates local shared memory first; spawn_sidecar then launches the
-    # Rust network sidecar with the matching shm path. Configure the sidecar via
-    # MA_* env vars, e.g. MA_SIDECAR_BINARY, MA_BACKEND_ADDR, MA_SERVER_NAME,
-    # MA_TENANT_ID, MA_ROBOT_ID and MA_AUTH_TOKEN_FILE.
-    sdk = ma.Client(
-        ma.ClientConfig(
-            instance_name="bimanual_so101",
-            cameras=(
-                ma.CameraConfig(
-                    name="front",
-                    width=640,
-                    height=480,
-                    pixel_format=ma.PixelFormat.RGB8,
-                    monitoring_profile=ma.MediaProfile(
-                        width=320,
-                        height=240,
-                        fps=5,
-                        jpeg_quality=60,
-                    ),
-                    teleop_profile=ma.MediaProfile(
-                        width=640,
-                        height=480,
-                        fps=30,
-                        jpeg_quality=80,
-                    ),
-                ),
-            ),
-        )
-    )
-    sdk.start()
-    print("started Mixed Autonomy SDK shared memory:")
-    print(f"  shm_path={sdk.config.resolved_shared_memory_path}")
-    sidecar = ma.spawn_sidecar(sdk)
-    atexit.register(_terminate_sidecar, sidecar)
-    print(f"  sidecar_pid={sidecar.pid}")
+    # --- Robot telemetry and HIL
     last_ma_command_sequence: int | None = None
-    last_ma_discrete_sequence: int | None = None
-    last_ma_instruction_sequence: int | None = None
 
     # --- Dataset Recording Setup (Optional) ---
     eval_dataset = None
@@ -186,11 +139,13 @@ def run_evaluation_loop(
                 rate_limiter.sleep(env)
 
             now_ns = time.monotonic_ns()
-            state = np.asarray(observation_dict["observation.state"], dtype=np.float64)
-            sdk.telemetry.try_publish_state(
+            state = np.asarray(
+                observation_dict["observation.state"], dtype=np.float64
+            ).reshape(-1)
+            sdk.telemetry.try_publish_joint_positions(
                 timestamp_ns=now_ns,
-                qpos=state,
-                qvel=np.zeros_like(state),
+                positions=state,
+                raise_on_invalid=True,
             )
             frame_rgb = np.ascontiguousarray(
                 observation_dict["observation.images.top_rgb"], dtype=np.uint8
@@ -214,20 +169,15 @@ def run_evaluation_loop(
                 )
 
             ma_discrete = sdk.control.read_discrete()
-            if (
-                ma_discrete is not None
-                and ma_discrete.meta.sequence != last_ma_discrete_sequence
-            ):
-                last_ma_discrete_sequence = ma_discrete.meta.sequence
+            if ma_discrete is not None:
                 print(f"DEBUG MA discrete command: {ma_discrete}")
 
             ma_instruction = sdk.instructions.read_if_new()
-            if (
-                ma_instruction is not None
-                and ma_instruction.sequence != last_ma_instruction_sequence
-            ):
-                last_ma_instruction_sequence = ma_instruction.sequence
-                print(f"DEBUG MA instruction: {ma_instruction.text}")
+            if ma_instruction is not None and ma_instruction.text:
+                print(
+                    f"New Mixed Autonomy text instruction: {ma_instruction.text}",
+                    flush=True,
+                )
 
             # 3. Policy Inference (The core abstraction)
             # Input: Numpy Dict -> Output: Numpy Array
@@ -340,9 +290,6 @@ def run_evaluation_loop(
         )
         eval_dataset.finalize()
 
-    _terminate_sidecar(sidecar)
-    atexit.unregister(_terminate_sidecar)
-    sdk.close()
     return all_episode_metrics
 
 
@@ -444,7 +391,7 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
             target_frame_name="gripper_frame_link",
             joint_names=joint_names,
         )
-        logger.info(f"IK solver loaded.")
+        logger.info("IK solver loaded.")
 
     # 4. Load Evaluation List
     # Only loads from 'Release' directory based on garment_type
@@ -498,8 +445,22 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
     env_cfg.garment_version = first_stage
     env = gym.make(args.task, cfg=env_cfg).unwrapped
     env.initialize_obs()
+    resources = ExitStack()
 
     try:
+        mixed_autonomy_config = build_mixed_autonomy_evaluation_config(
+            task_description=args.task_description,
+            is_bimanual=is_bimanual,
+        )
+        sdk = resources.enter_context(ma.Client(mixed_autonomy_config.client))
+        sidecar = resources.enter_context(
+            ma.managed_sidecar(sdk, mixed_autonomy_config.sidecar)
+        )
+        logger.info(
+            "Started Mixed Autonomy SDK at %s with sidecar pid %s",
+            sdk.config.resolved_shared_memory_path,
+            sidecar.pid,
+        )
         for garment_idx, (garment_name, garment_stage) in enumerate(eval_list):
             logger.info(
                 f"Evaluating: {garment_name} ({garment_stage}) ({garment_idx+1}/{len(eval_list)})"
@@ -524,6 +485,7 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
                 env=env,
                 policy=policy,
                 args=args,
+                sdk=sdk,
                 ee_solver=ee_solver,
                 is_bimanual=is_bimanual,
                 garment_name=garment_name,
@@ -534,7 +496,10 @@ def eval(args: argparse.Namespace, simulation_app: Any) -> None:
             )
 
     finally:
-        env.close()
+        try:
+            resources.close()
+        finally:
+            env.close()
 
     # Print summary across all garments
     logger.info("=" * 60)
